@@ -11,13 +11,17 @@
   input { width: 60%; min-width: 260px; padding: 8px; font-size: 15px; box-sizing: border-box; }
   button { padding: 8px 14px; font-size: 15px; cursor: pointer; }
   #status { color: #555; min-height: 1.4em; margin-top: 12px; }
-  #download { position: fixed; top: 12px; right: 12px; display: none; }
+  #downloads { position: fixed; top: 12px; right: 12px; display: none; gap: 8px; }
+  #downloads button { padding: 8px 12px; }
   #preview { max-width: 820px; margin: 24px auto; }
   #preview img { width: 100%; display: block; margin: 10px auto; border: 1px solid #ccc; }
 </style>
 </head>
 <body>
-  <button id="download" disabled>Download PDF</button>
+  <div id="downloads">
+    <button id="download-optimized" disabled>Download optimized PDF</button>
+    <button id="download-large" disabled>Download large PDF</button>
+  </div>
 
   <div class="center">
     <h1>FlipHTML5 → PDF</h1>

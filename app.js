@@ -6,22 +6,33 @@
   var $go = document.getElementById("go");
   var $status = document.getElementById("status");
   var $preview = document.getElementById("preview");
-  var $download = document.getElementById("download");
+  var $downloads = document.getElementById("downloads");
+  var $dlOptimized = document.getElementById("download-optimized");
+  var $dlLarge = document.getElementById("download-large");
 
   var DECODER_URL =
     "https://static.fliphtml5.com/resourceFiles/html5_templates/js/deString.js";
 
+  var CONCURRENCY = 10;   // pages downloaded at the same time
+  var MAX_RETRIES = 5;    // per page, on rate limiting / network errors
+
+  // two output qualities, built from the same decoded pages
+  var QUALITY = {
+    optimized: { maxSide: 1200, quality: 0.72 }, // smaller file
+    large:     { maxSide: 1700, quality: 0.92 }, // best quality / bigger file
+  };
+
   var modulePromise = null;
-  var downloadUrl = null;
+  var downloadUrls = { optimized: null, large: null };
+  var objectUrls = [];
   var busy = false;
 
-  function setStatus(msg) {
-    $status.textContent = msg || "";
-  }
+  function setStatus(msg) { $status.textContent = msg || ""; }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
   // ---- 1. validate the link -------------------------------------------------
   function parseBook(input) {
-    var url = new URL(input.trim()); // throws on invalid URL
+    var url = new URL(input.trim());
     if (!/(^|\.)fliphtml5\.com$/i.test(url.hostname)) {
       throw new Error("Not a fliphtml5.com link");
     }
@@ -74,21 +85,55 @@
     return JSON.parse(out);
   }
 
-  // ---- 4. image helpers -----------------------------------------------------
-  function loadImage(src) {
-    return new Promise(function (resolve, reject) {
-      var img = new Image();
-      img.crossOrigin = "anonymous"; // so the canvas stays exportable
-      img.onload = function () { resolve(img); };
-      img.onerror = function () { reject(new Error("image failed: " + src)); };
-      img.src = src;
-    });
+  // ---- 4. fetching with rate-limit handling --------------------------------
+  function backoff(attempt) {
+    return Math.min(10000, 400 * Math.pow(2, attempt)) + Math.random() * 200;
   }
 
-  function toJpeg(img, maxSide) {
-    var w = img.naturalWidth, h = img.naturalHeight;
-    var scale = Math.min(1, maxSide / Math.max(w, h));
-    var cw = Math.round(w * scale), ch = Math.round(h * scale);
+  async function fetchBlob(url, attempt) {
+    attempt = attempt || 0;
+    var resp;
+    try {
+      resp = await fetch(url, { cache: "force-cache" });
+    } catch (e) {
+      if (attempt < MAX_RETRIES) {
+        await sleep(backoff(attempt));
+        return fetchBlob(url, attempt + 1);
+      }
+      throw e;
+    }
+
+    var ct = resp.headers.get("content-type") || "";
+    var rateLimited = resp.status === 429 || resp.status === 503;
+    // a soft block often returns 200 with an HTML body instead of an image
+    var wrongType = resp.ok && !ct.startsWith("image/");
+
+    if (rateLimited || wrongType) {
+      if (attempt >= MAX_RETRIES) {
+        throw new Error("blocked/rate-limited (HTTP " + resp.status + ", " + ct + ")");
+      }
+      var ra = parseFloat(resp.headers.get("retry-after"));
+      var delay = (!isNaN(ra) && ra > 0)
+        ? ra * 1000
+        : Math.min(30000, 500 * Math.pow(2, attempt)) + Math.random() * 300;
+      setStatus("Rate limited — waiting " + Math.round(delay / 1000) + "s…");
+      await sleep(delay);
+      return fetchBlob(url, attempt + 1);
+    }
+
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    return await resp.blob();
+  }
+
+  // ---- 5. image -> jpeg -----------------------------------------------------
+  function size(src) {
+    return { w: src.width || src.naturalWidth, h: src.height || src.naturalHeight };
+  }
+
+  function toJpeg(src, maxSide, quality) {
+    var s = size(src);
+    var scale = Math.min(1, maxSide / Math.max(s.w, s.h));
+    var cw = Math.round(s.w * scale), ch = Math.round(s.h * scale);
 
     var canvas = document.createElement("canvas");
     canvas.width = cw;
@@ -96,9 +141,9 @@
     var ctx = canvas.getContext("2d");
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, cw, ch);
-    ctx.drawImage(img, 0, 0, cw, ch);
+    ctx.drawImage(src, 0, 0, cw, ch);
 
-    var dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+    var dataUrl = canvas.toDataURL("image/jpeg", quality);
     var b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
     var bin = atob(b64);
     var data = new Uint8Array(bin.length);
@@ -106,20 +151,53 @@
     return { data: data, w: cw, h: ch };
   }
 
-  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function loadImage(src) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error("image failed")); };
+      img.src = src;
+    });
+  }
 
-  // ---- 5. main flow ---------------------------------------------------------
+  // ---- 6. run N workers over N jobs, keeping results indexed ---------------
+  async function runPool(n, limit, worker) {
+    var next = 0;
+    async function runner() {
+      while (true) {
+        var i = next++;
+        if (i >= n) return;
+        await worker(i);
+      }
+    }
+    var runners = [];
+    for (var k = 0; k < Math.min(limit, n); k++) runners.push(runner());
+    await Promise.all(runners);
+  }
+
+  function buildBlobUrl(pdfPages) {
+    var bytes = window.buildPDF(pdfPages, { width: 612, height: 792 });
+    return URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+  }
+
+  // ---- 7. main flow ---------------------------------------------------------
   async function start() {
     if (busy) return;
     busy = true;
     $go.disabled = true;
-    $download.disabled = true;
-    $download.style.display = "none";
+    $downloads.style.display = "none";
+    $dlOptimized.disabled = true;
+    $dlLarge.disabled = true;
     $preview.innerHTML = "";
-    if (downloadUrl) { URL.revokeObjectURL(downloadUrl); downloadUrl = null; }
+    objectUrls.forEach(function (u) { URL.revokeObjectURL(u); });
+    objectUrls = [];
+    ["optimized", "large"].forEach(function (k) {
+      if (downloadUrls[k]) { URL.revokeObjectURL(downloadUrls[k]); downloadUrls[k] = null; }
+    });
 
+    var book;
     try {
-      var book = parseBook($url.value);
+      book = parseBook($url.value);
     } catch (e) {
       setStatus("Invalid link: " + e.message);
       busy = false; $go.disabled = false;
@@ -142,36 +220,65 @@
       var pages = decodePages(encoded);
       if (!pages.length) throw new Error("no pages found");
 
-      setStatus("Found " + pages.length + " pages. Loading images…");
+      var items = [];
+      pages.forEach(function (pg) { if (pg.n && pg.n[0]) items.push(pg.n[0]); });
+      setStatus("Found " + items.length + " pages. Loading " + CONCURRENCY + " at a time…");
 
-      var pdfPages = [];
-      for (var i = 0; i < pages.length; i++) {
-        var rel = pages[i].n && pages[i].n[0];
-        if (!rel) continue;
+      var imgs = items.map(function () {
+        var im = document.createElement("img");
+        $preview.appendChild(im);
+        return im;
+      });
 
-        var img;
+      var optPages = new Array(items.length);
+      var largePages = new Array(items.length);
+      var done = 0, failed = 0;
+
+      await runPool(items.length, CONCURRENCY, async function (i) {
+        var url = book.base + items[i];
+        var blob;
         try {
-          img = await loadImage(book.base + rel);
+          blob = await fetchBlob(url);
         } catch (e) {
-          continue; // skip a broken page, keep going
+          console.warn("page " + (i + 1) + " failed:", e);
+          optPages[i] = null; largePages[i] = null; failed++;
+          return;
         }
 
-        $preview.appendChild(img);
-        pdfPages.push(toJpeg(img, 1600));
-        setStatus("Loaded " + (i + 1) + " / " + pages.length + " pages…");
-        await sleep(0); // let the UI breathe
-      }
+        var objectUrl = URL.createObjectURL(blob);
+        objectUrls.push(objectUrl);
+        imgs[i].src = objectUrl;
 
-      if (!pdfPages.length) throw new Error("no images could be loaded");
+        var source;
+        try {
+          source = await createImageBitmap(blob);
+        } catch (e) {
+          source = await loadImage(objectUrl); // fallback decoder
+        }
 
-      setStatus("Building PDF…");
-      var bytes = window.buildPDF(pdfPages, { width: 612, height: 792 });
-      var blob = new Blob([bytes], { type: "application/pdf" });
-      downloadUrl = URL.createObjectURL(blob);
+        optPages[i] = toJpeg(source, QUALITY.optimized.maxSide, QUALITY.optimized.quality);
+        largePages[i] = toJpeg(source, QUALITY.large.maxSide, QUALITY.large.quality);
 
-      $download.disabled = false;
-      $download.style.display = "block";
-      setStatus("Done — " + pdfPages.length + " pages. Click Download PDF (top right).");
+        done++;
+        setStatus("Loaded " + done + " / " + items.length + " pages…");
+      });
+
+      var optOk = optPages.filter(Boolean);
+      var largeOk = largePages.filter(Boolean);
+      if (!optOk.length) throw new Error("no images could be loaded");
+
+      setStatus("Building PDFs…");
+      downloadUrls.optimized = buildBlobUrl(optOk);
+      downloadUrls.large = buildBlobUrl(largeOk);
+
+      $dlOptimized.disabled = false;
+      $dlLarge.disabled = false;
+      $downloads.style.display = "flex";
+      setStatus(
+        "Done — " + optOk.length + " pages" +
+        (failed ? " (" + failed + " skipped)" : "") +
+        ". Choose optimized (small) or large (best quality)."
+      );
     } catch (e) {
       setStatus("Error: " + e.message);
     } finally {
@@ -180,22 +287,29 @@
     }
   }
 
-  // ---- 6. events ------------------------------------------------------------
-  $go.addEventListener("click", start);
-  $url.addEventListener("keydown", function (e) {
-    if (e.key === "Enter") start();
-  });
-  $download.addEventListener("click", function () {
-    if (!downloadUrl) return;
+  function save(kind) {
+    if (!downloadUrls[kind]) return;
     var a = document.createElement("a");
-    a.href = downloadUrl;
-    a.download = (parseBookSafe($url.value) || "book") + ".pdf";
+    a.href = downloadUrls[kind];
+    a.download = (parseBookSafe($url.value) || "book") + "-" + kind + ".pdf";
     document.body.appendChild(a);
     a.click();
     a.remove();
-  });
+  }
+
+  // ---- 8. events ------------------------------------------------------------
+  $go.addEventListener("click", start);
+  $url.addEventListener("keydown", function (e) { if (e.key === "Enter") start(); });
+  $dlOptimized.addEventListener("click", function () { save("optimized"); });
+  $dlLarge.addEventListener("click", function () { save("large"); });
 
   function parseBookSafe(v) {
     try { return parseBook(v).name; } catch (e) { return null; }
   }
+
+  // optional auto-start: index.html?url=https://online.fliphtml5.com/<user>/<book>/
+  try {
+    var preset = new URLSearchParams(location.search).get("url");
+    if (preset) { $url.value = preset; start(); }
+  } catch (e) {}
 })();

@@ -7,7 +7,13 @@ downloads every page image and builds a PDF in your browser.
 
 Open the GitHub Pages URL and paste a link like
 `https://online.fliphtml5.com/<user>/<book>/`, then press Enter.
-A **Download PDF** button appears at the top right when the pages are ready.
+When the pages are ready two buttons appear at the top right:
+
+- **Download optimized PDF** — smaller file (pages downscaled to 1200px, JPEG q72, ~15 MB for 109 pages)
+- **Download large PDF** — best quality (full 1700px, JPEG q92, ~39 MB for 109 pages)
+
+You can also share a link that auto-starts, e.g.
+`https://<user>.github.io/webpdf/?url=https://online.fliphtml5.com/<user>/<book>/`
 
 ## How it works
 
@@ -16,8 +22,9 @@ A **Download PDF** button appears at the top right when the pages are ready.
    `fliphtml5_pages` string.
 3. Decodes it with FlipHTML5's own WebAssembly decoder (`deString.js`) to get
    every page image's real filename.
-4. Loads the images one by one, shows a preview, converts them to JPEG with
-   `<canvas>`, and assembles a PDF with the bundled `pdf.js`.
+4. Loads the images **10 at a time** (with retry/backoff on 429/503), shows a
+   preview, converts them to JPEG with `<canvas>` at two qualities, and
+   assembles both PDFs with the bundled `pdf.js`.
 
 Everything runs client-side — no server. It relies on FlipHTML5 serving
 `Access-Control-Allow-Origin: *` for the config, images and decoder.
